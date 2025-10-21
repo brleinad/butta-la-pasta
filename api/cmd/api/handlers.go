@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"dev.brleinad/butta-la-pasta/internal/response"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/responses"
 )
 
 func (app *application) status(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +77,69 @@ func fetchProductFromOpenFoodFacts(barcode string) (string, error) {
 	return offResp.Product.ProductName, nil
 }
 
+type CookingTimes struct {
+	CookingTimeMinutes int  `json:"cooking_time_minutes"`
+	AlDenteTimeMinutes *int `json:"al_dente_time_minutes,omitempty"`
+}
+
+// stripMarkdownCodeFence removes markdown code fences from the content
+func stripMarkdownCodeFence(content string) string {
+	content = strings.TrimSpace(content)
+
+	// Remove ```json or ``` at the start
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+	}
+
+	// Remove ``` at the end
+	if strings.HasSuffix(content, "```") {
+		content = strings.TrimSuffix(content, "```")
+	}
+
+	return strings.TrimSpace(content)
+}
+
+func (app *application) getCookingTimesFromAI(productName string) (*CookingTimes, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	prompt := fmt.Sprintf(`Given this pasta product: "%s", use web search to find the recommended cooking time and al dente cooking time in minutes.
+Return ONLY a JSON object with this exact structure:
+{
+  "cooking_time_minutes": <integer>,
+  "al_dente_time_minutes": <integer or null>
+}
+
+If al dente time is unknown or not applicable, use null.`, productName)
+
+	resp, err := app.openaiClient.Responses.New(ctx, responses.ResponseNewParams{
+		Input: responses.ResponseNewParamsInputUnion{
+			OfString: openai.String(prompt),
+		},
+		Model: "gpt-4o-mini",
+		Tools: []responses.ToolUnionParam{
+			responses.ToolParamOfWebSearchPreview(responses.WebSearchToolTypeWebSearchPreview),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get response from OpenAI: %w", err)
+	}
+
+	content := resp.OutputText()
+
+	// Strip markdown code fences if present
+	cleanContent := stripMarkdownCodeFence(content)
+
+	var cookingTimes CookingTimes
+	if err := json.Unmarshal([]byte(cleanContent), &cookingTimes); err != nil {
+		return nil, fmt.Errorf("failed to parse cooking times from AI response: %w", err)
+	}
+
+	return &cookingTimes, nil
+}
+
 func (app *application) getPastaByBarcode(w http.ResponseWriter, r *http.Request) {
 	barcode := r.PathValue("barcode")
 
@@ -90,9 +157,18 @@ func (app *application) getPastaByBarcode(w http.ResponseWriter, r *http.Request
 			// Log the product name
 			app.logger.Info("Found product in Open Food Facts", "barcode", barcode, "name", productName)
 
-			// Create pasta in DB with hardcoded cooking time
-			cookingTime := 1
-			pasta, err = app.db.CreatePasta(barcode, productName, cookingTime, nil)
+			// Get cooking times from AI
+			cookingTimes, aiErr := app.getCookingTimesFromAI(productName)
+			if aiErr != nil {
+				app.logger.Error("Failed to get cooking times from AI", "error", aiErr, "product", productName)
+				// Fallback to default cooking time
+				cookingTime := 1
+				pasta, err = app.db.CreatePasta(barcode, productName, cookingTime, nil)
+			} else {
+				app.logger.Info("Got cooking times from AI", "cooking_time", cookingTimes.CookingTimeMinutes, "al_dente_time", cookingTimes.AlDenteTimeMinutes)
+				pasta, err = app.db.CreatePasta(barcode, productName, cookingTimes.CookingTimeMinutes, cookingTimes.AlDenteTimeMinutes)
+			}
+
 			if err != nil {
 				app.serverError(w, r, err)
 				return
