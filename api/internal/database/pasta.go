@@ -34,3 +34,18 @@ func (db *DB) GetPastaByBarcode(barcode string) (*Pasta, error) {
 
 	return &pasta, nil
 }
+
+func (db *DB) CreatePasta(barcode, name string, cookingTimeMinutes int, alDenteTimeMinutes *int) (*Pasta, error) {
+	query := `
+		INSERT INTO pasta (barcode, name, cooking_time_minutes, al_dente_time_minutes)
+		VALUES (?, ?, ?, ?)
+	`
+
+	_, err := db.Exec(query, barcode, name, cookingTimeMinutes, alDenteTimeMinutes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Retrieve the newly created pasta
+	return db.GetPastaByBarcode(barcode)
+}
